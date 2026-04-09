@@ -1,52 +1,28 @@
-import Prompt from "../models/Prompt.js";
+// REMOVED: Prompt API — replaced by final AI configuration architecture.
+//
+// Prompt was a legacy per-page AI config store that competed with:
+//   - Page.customInstructions (inline quick override)
+//   - PageInstruction collection (structured instruction list)
+//
+// Final AI configuration sources (authoritative):
+//   - Page fields: language, tone, replyStyle, customInstructions
+//   - PageInstruction collection: ordered, toggle-able instruction rules
+//   - Product collection: product knowledge base
+//
+// Migration:
+//   - Use PATCH /api/pages/:pageId/settings for page-level AI settings
+//   - Use POST /api/instructions/:pageId for structured instruction rules
 
-// @desc    Get prompt for a page
-// @route   GET /api/prompts/:pageId
-// @access  Private
-const getPrompt = async (req, res, next) => {
-    try {
-        const prompt = await Prompt.findOne({
-            pageId: req.params.pageId,
-            userId: req.user.uid,
-        });
+const REMOVED_MSG =
+    "This endpoint has been removed. Use PATCH /api/pages/:pageId/settings for AI settings " +
+    "and /api/instructions/:pageId for instruction rules.";
 
-        if (!prompt) {
-            return res.json({
-                success: true,
-                data: {
-                    pageId: req.params.pageId,
-                    template:
-                        "You are a helpful customer support assistant. Reply politely and concisely to the following message.",
-                    tone: "professional",
-                    fallbackMessage:
-                        "Thank you for your message! Our team will get back to you shortly.",
-                },
-            });
-        }
-
-        res.json({ success: true, data: prompt });
-    } catch (error) {
-        next(error);
-    }
+const getPrompt = (_req, res) => {
+    res.status(410).json({ success: false, message: REMOVED_MSG });
 };
 
-// @desc    Create or update prompt for a page
-// @route   PUT /api/prompts/:pageId
-// @access  Private
-const upsertPrompt = async (req, res, next) => {
-    try {
-        const { template, tone, fallbackMessage } = req.body;
-
-        const prompt = await Prompt.findOneAndUpdate(
-            { pageId: req.params.pageId, userId: req.user.uid },
-            { template, tone, fallbackMessage },
-            { new: true, upsert: true }
-        );
-
-        res.json({ success: true, data: prompt });
-    } catch (error) {
-        next(error);
-    }
+const upsertPrompt = (_req, res) => {
+    res.status(410).json({ success: false, message: REMOVED_MSG });
 };
 
 export { getPrompt, upsertPrompt };

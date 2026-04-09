@@ -7,10 +7,11 @@ import {
     deleteInstruction,
 } from "../controllers/instructionController.js";
 import { protect } from "../middlewares/authMiddleware.js";
+import { attachWorkspace } from "../middlewares/workspaceMiddleware.js";
 
 const router = express.Router();
 
-router.use(protect);
+router.use(protect, attachWorkspace);
 
 router.get("/:pageId", getInstructions);
 router.post("/:pageId", addInstruction);

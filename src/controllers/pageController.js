@@ -8,6 +8,11 @@ import {
 
 const GRAPH_API = "https://graph.facebook.com/v19.0";
 
+// ─── Helper ───────────────────────────────────────────────────────────────────
+// Resolve the workspace ID for the current request. Returns null if the user
+// has no workspace yet (no pages connected).
+const getWorkspaceId = (req) => req.workspace?._id || null;
+
 // @desc    Get Facebook OAuth URL
 // @route   GET /api/pages/auth/facebook
 // @access  Private
@@ -16,7 +21,7 @@ const getFacebookAuthURL = (req, res) => {
     res.json({ success: true, data: { url } });
 };
 
-// @desc    Handle Facebook OAuth callback – exchange code for token and return pages
+// @desc    Handle Facebook OAuth callback — exchange code for token and return pages
 // @route   GET /api/pages/auth/facebook/callback
 // @access  Private
 const handleFacebookCallback = async (req, res, next) => {
@@ -28,22 +33,16 @@ const handleFacebookCallback = async (req, res, next) => {
             throw new Error("Authorization code is required");
         }
 
-        // Exchange code for user access token
         const userAccessToken = await exchangeCodeForToken(code);
-
-        // Fetch pages the user manages
         const pages = await getUserPages(userAccessToken);
 
-        res.json({
-            success: true,
-            data: { pages },
-        });
+        res.json({ success: true, data: { pages } });
     } catch (error) {
         next(error);
     }
 };
 
-// @desc    Connect (save) a Facebook page
+// @desc    Connect (save) a Facebook page — workspace-owned
 // @route   POST /api/pages/connect
 // @access  Private
 const connectPage = async (req, res, next) => {
@@ -55,10 +54,29 @@ const connectPage = async (req, res, next) => {
             throw new Error("pageId, pageName, and pageAccessToken are required");
         }
 
-        // Upsert – update if already connected, create if new
+        const workspaceId = getWorkspaceId(req);
+        if (!workspaceId) {
+            return res.status(403).json({ success: false, message: "No active workspace. Use Facebook OAuth to connect pages." });
+        }
+
+        // Enforce global uniqueness: one active connection per page
+        const conflict = await Page.findOne({ pageId, isActive: true });
+        if (conflict && String(conflict.workspaceId) !== String(workspaceId)) {
+            return res.status(409).json({ success: false, message: "This page is already connected to another workspace." });
+        }
+
+        // Upsert — use workspaceId as the primary ownership key
+        // userId is preserved for backward compat with the legacy unique index
         const page = await Page.findOneAndUpdate(
-            { userId: req.user.uid, pageId },
-            { pageName, pageAccessToken, pagePicture: pagePicture || "", isActive: true },
+            { workspaceId, pageId },
+            {
+                workspaceId,
+                userId: req.user.uid, // kept for DB index compat only
+                pageName,
+                pageAccessToken,
+                pagePicture: pagePicture || "",
+                isActive: true,
+            },
             { new: true, upsert: true }
         );
 
@@ -68,55 +86,58 @@ const connectPage = async (req, res, next) => {
     }
 };
 
-
+// @desc    List active pages for the current workspace
+// @route   GET /api/pages
+// @access  Private
 const getMyPages = async (req, res, next) => {
     try {
-        const filter = { userId: req.user.uid, isActive: true };
-        const pages = await Page.find(filter)
-            .select("pageId pageName pagePicture planType aiEnabled connectedAt")
+        const workspaceId = getWorkspaceId(req);
+
+        if (!workspaceId) {
+            return res.json({ success: true, data: [] });
+        }
+
+        const pages = await Page.find({ workspaceId, isActive: true })
+            .select("pageId pageName pagePicture aiEnabled automationEnabled connectedAt totalMessages monthlyUsageCount")
             .lean();
+
         res.json({ success: true, data: pages });
     } catch (error) {
         next(error);
     }
 };
 
-// @desc    Disconnect (deactivate) a page
+// @desc    Disconnect (deactivate) a page from the current workspace
 // @route   DELETE /api/pages/:pageId
 // @access  Private
 const disconnectPage = async (req, res, next) => {
     try {
-        const page = await Page.findOne({
-            pageId: req.params.pageId,
-            userId: req.user.uid,
-        });
-
-        if (!page) {
-            res.status(404);
-            throw new Error("Page not found");
+        const workspaceId = getWorkspaceId(req);
+        if (!workspaceId) {
+            return res.status(403).json({ success: false, message: "No active workspace." });
         }
 
-        // Unsubscribe webhook from Facebook (best-effort)
+        const page = await Page.findOne({ pageId: req.params.pageId, workspaceId });
+        if (!page) {
+            return res.status(404).json({ success: false, message: "Page not found" });
+        }
+
+        // Unsubscribe webhook (best-effort)
         try {
             await axios.delete(
                 `${GRAPH_API}/${page.pageId}/subscribed_apps`,
                 { params: { access_token: page.pageAccessToken } }
             );
-            console.log(`Unsubscribed webhook from page: ${page.pageName}`);
-
-            // Also revoke permissions to completely remove the app from the page
             await axios.delete(
                 `${GRAPH_API}/${page.pageId}/permissions`,
                 { params: { access_token: page.pageAccessToken } }
             );
-            console.log(`Revoked permissions for page: ${page.pageName}`);
         } catch (fbErr) {
-            console.log("Facebook disconnect error (non-fatal):", fbErr.response?.data || fbErr.message);
+            console.log("Facebook disconnect (non-fatal):", fbErr.response?.data || fbErr.message);
         }
 
-        // Hard delete from DB
-        await Page.deleteOne({ pageId: req.params.pageId, userId: req.user.uid });
-        console.log(`Page ${page.pageName} (${page.pageId}) permanently removed for user ${req.user.uid}`);
+        // Hard delete
+        await Page.deleteOne({ pageId: req.params.pageId, workspaceId });
 
         res.json({ success: true, message: "Page removed successfully" });
     } catch (error) {
@@ -132,9 +153,11 @@ const updatePageSettings = async (req, res, next) => {
         const { pageId } = req.params;
         const { aiEnabled, language, tone, replyStyle, customInstructions } = req.body;
 
-        console.log("Updating settings for page:", pageId);
+        const workspaceId = getWorkspaceId(req);
+        if (!workspaceId) {
+            return res.status(403).json({ success: false, message: "No active workspace." });
+        }
 
-        // Validate field types
         const errors = [];
         if (aiEnabled !== undefined && typeof aiEnabled !== "boolean") errors.push("aiEnabled must be a boolean");
         if (language !== undefined && typeof language !== "string") errors.push("language must be a string");
@@ -146,7 +169,6 @@ const updatePageSettings = async (req, res, next) => {
             return res.status(400).json({ success: false, message: errors.join(", ") });
         }
 
-        // Build update object with only provided fields
         const updateFields = {};
         if (aiEnabled !== undefined) updateFields.aiEnabled = aiEnabled;
         if (language !== undefined) updateFields.language = language;
@@ -154,10 +176,8 @@ const updatePageSettings = async (req, res, next) => {
         if (replyStyle !== undefined) updateFields.replyStyle = replyStyle;
         if (customInstructions !== undefined) updateFields.customInstructions = customInstructions;
 
-        console.log("Changed fields:", updateFields);
-
         const page = await Page.findOneAndUpdate(
-            { pageId, userId: req.user.uid },
+            { pageId, workspaceId },
             { $set: updateFields },
             { new: true }
         ).select("-pageAccessToken");
@@ -172,7 +192,7 @@ const updatePageSettings = async (req, res, next) => {
     }
 };
 
-// @desc    Update AI Settings for a specific page
+// @desc    Update AI settings (alias kept for API compatibility)
 // @route   PATCH /api/pages/:pageId/ai-settings
 // @access  Private
 const updatePageAISettings = async (req, res, next) => {
@@ -180,25 +200,57 @@ const updatePageAISettings = async (req, res, next) => {
         const { pageId } = req.params;
         const { customInstructions, language, replyStyle, tone } = req.body;
 
-        const page = await Page.findOne({ pageId, userId: req.user.uid });
+        const workspaceId = getWorkspaceId(req);
+        if (!workspaceId) {
+            return res.status(403).json({ success: false, message: "No active workspace." });
+        }
 
+        const page = await Page.findOne({ pageId, workspaceId });
         if (!page) {
             res.status(404);
             throw new Error("Page not found or unauthorized");
         }
 
-        // Only update fields that were provided in the request
         if (customInstructions !== undefined) page.customInstructions = String(customInstructions);
         if (language !== undefined) page.language = String(language);
         if (replyStyle !== undefined) page.replyStyle = String(replyStyle);
         if (tone !== undefined) page.tone = String(tone);
 
         const updatedPage = await page.save();
+        res.json({ success: true, data: updatedPage });
+    } catch (error) {
+        next(error);
+    }
+};
 
-        res.json({
-            success: true,
-            data: updatedPage,
-        });
+// @desc    Toggle per-page automation
+// @route   PATCH /api/pages/:pageId/automation
+// @access  Private
+const toggleAutomation = async (req, res, next) => {
+    try {
+        const { pageId } = req.params;
+        const { automationEnabled } = req.body;
+
+        if (typeof automationEnabled !== "boolean") {
+            return res.status(400).json({ success: false, message: "automationEnabled must be a boolean" });
+        }
+
+        const workspaceId = getWorkspaceId(req);
+        if (!workspaceId) {
+            return res.status(403).json({ success: false, message: "No active workspace." });
+        }
+
+        const page = await Page.findOneAndUpdate(
+            { pageId, workspaceId },
+            { $set: { automationEnabled } },
+            { new: true }
+        ).select("pageId pageName automationEnabled aiEnabled");
+
+        if (!page) {
+            return res.status(404).json({ success: false, message: "Page not found" });
+        }
+
+        res.json({ success: true, data: page });
     } catch (error) {
         next(error);
     }
@@ -212,4 +264,5 @@ export {
     disconnectPage,
     updatePageSettings,
     updatePageAISettings,
+    toggleAutomation,
 };

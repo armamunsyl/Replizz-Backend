@@ -1,32 +1,112 @@
 import axios from "axios";
 import Page from "../models/Page.js";
+import Workspace from "../models/Workspace.js";
 import Conversation from "../models/Conversation.js";
+import ConversationMessage from "../models/ConversationMessage.js";
 import MessageLog from "../models/MessageLog.js";
 import PageInstruction from "../models/PageInstruction.js";
 import { sendMessage, markSeen, showTyping, addReaction } from "../services/facebookService.js";
 import { generateAIReply, analyzeImage, updateContextStory, classifyImageIntent, generateImageReply } from "../../utils/openai.js";
 import { buildDynamicPrompt, buildMemoryContext } from "../../utils/promptBuilder.js";
 import { detectEmotion, getReactionForEmotion } from "../../utils/emotionDetector.js";
+import { getIO } from "../socket.js";
 
-// Helper to fetch Facebook user profile (name and profile picture) using PSID
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
 const fetchUserProfile = async (psid, pageAccessToken) => {
     try {
-        const response = await axios.get(`https://graph.facebook.com/v19.0/${psid}`, {
-            params: {
-                fields: "first_name,last_name,profile_pic",
-                access_token: pageAccessToken,
-            },
+        const res = await axios.get(`https://graph.facebook.com/v19.0/${psid}`, {
+            params: { fields: "first_name,last_name,profile_pic", access_token: pageAccessToken },
         });
-        const data = response.data;
-        const name = [data.first_name, data.last_name].filter(Boolean).join(" ") || "Unknown User";
-        const profilePic = data.profile_pic || null;
-        console.log(`✅ Successfully fetched profile for PSID ${psid}: ${name}`);
-        return { name, profilePic };
-    } catch (err) {
-        console.error(`❌ Failed to fetch profile for PSID ${psid}:`, err.response?.data?.error?.message || err.message);
+        const d = res.data;
+        return {
+            name: [d.first_name, d.last_name].filter(Boolean).join(" ") || "Unknown User",
+            profilePic: d.profile_pic || null,
+        };
+    } catch (_) {
         return { name: "Unknown User", profilePic: null };
     }
 };
+
+/**
+ * Workspace-level quota check.
+ * Returns true if the workspace has capacity, false if exhausted.
+ * Falls back gracefully if workspace is not yet set on the page.
+ */
+const hasQuota = async (page) => {
+    if (!page.workspaceId) {
+        // Legacy path: no workspace assigned yet, always allow (migration period)
+        console.log(`⚠️  Page ${page.pageId} has no workspaceId — skipping quota check`);
+        return true;
+    }
+
+    const workspace = await Workspace.findById(page.workspaceId);
+    if (!workspace) return true; // workspace deleted — allow during cleanup
+
+    if (workspace.isSuspended) {
+        console.log(`🚫 Workspace ${workspace._id} is suspended`);
+        return false;
+    }
+
+    if (workspace.usedReplies >= workspace.replyLimit) {
+        console.log(`🚫 Workspace quota reached: ${workspace.usedReplies}/${workspace.replyLimit}`);
+        return false;
+    }
+
+    return true;
+};
+
+/**
+ * Increment workspace reply counter after a successful AI reply.
+ * Also increments page-level analytics.
+ */
+const incrementUsage = async (page, tokenData = {}) => {
+    const { inputTokens = 0, outputTokens = 0, totalTokens = 0, estimatedCost = 0 } = tokenData;
+
+    // Workspace-level
+    if (page.workspaceId) {
+        await Workspace.findByIdAndUpdate(page.workspaceId, {
+            $inc: { usedReplies: 1 },
+        });
+    }
+
+    // Page-level analytics (kept for per-page reporting)
+    await Page.findByIdAndUpdate(page._id, {
+        $inc: {
+            totalMessages: 1,
+            totalAIReplies: 1,
+            monthlyUsageCount: 1,
+            totalTokensUsed: totalTokens,
+        },
+    });
+};
+
+/**
+ * Write a message to the new ConversationMessage collection (scalable storage).
+ * This runs alongside the existing Conversation.messages $push for backward compat.
+ */
+const writeConversationMessage = async (conversation, page, role, content, tokenData = {}) => {
+    try {
+        if (!conversation?._id || !page?.workspaceId) return;
+        await ConversationMessage.create({
+            conversationId: conversation._id,
+            workspaceId: page.workspaceId,
+            pageId: page.pageId,
+            senderId: conversation.senderId,
+            role,
+            content,
+            inputTokens: tokenData.inputTokens || 0,
+            outputTokens: tokenData.outputTokens || 0,
+            totalTokens: tokenData.totalTokens || 0,
+            estimatedCost: tokenData.estimatedCost || 0,
+            attachmentType: tokenData.attachmentType || null,
+        });
+    } catch (err) {
+        console.log("ConversationMessage write error (non-blocking):", err.message);
+    }
+};
+
+// ─── Webhook Verification ─────────────────────────────────────────────────────
 
 const verifyWebhook = (req, res) => {
     const mode = req.query["hub.mode"];
@@ -37,10 +117,10 @@ const verifyWebhook = (req, res) => {
         console.log("✅ Webhook verified");
         return res.status(200).send(challenge);
     }
-
-    console.log("❌ Webhook verification failed");
     return res.sendStatus(403);
 };
+
+// ─── Main Incoming Message Handler ───────────────────────────────────────────
 
 const handleIncomingMessage = async (req, res) => {
     res.status(200).send("EVENT_RECEIVED");
@@ -59,110 +139,56 @@ const handleIncomingMessage = async (req, res) => {
         }
 
         for (const event of entry.messaging) {
-            console.log("==== FULL EVENT TYPE CHECK ====");
-
-            if (event.message) {
-                console.log("MESSAGE EVENT DETECTED");
-                console.log("is_echo:", event.message.is_echo);
-                console.log("sender:", event.sender?.id);
-                console.log("recipient:", event.recipient?.id);
-                console.log("pageId (entry.id):", pageId);
-                console.log("text:", event.message.text || "(no text)");
-            }
-
-            if (event.delivery) {
-                console.log("DELIVERY EVENT — skipping");
-            }
-
-            if (event.read) {
-                console.log("READ EVENT — skipping");
-            }
-
-            console.log("================================");
-
             // Skip non-message events
             if (!event.message) continue;
 
-            // Echo detection — distinguish bot reply echoes from admin manual replies
+            // ── Echo handling — admin manual replies ──────────────────────
             if (event.message.is_echo === true) {
                 const echoAppId = event.message.app_id;
                 const ourAppId = process.env.FACEBOOK_APP_ID;
-                console.log("🔔 ECHO EVENT DETAILS:");
-                console.log("  sender.id:", event.sender?.id);
-                console.log("  recipient.id:", event.recipient?.id);
-                console.log("  pageId:", pageId);
-                console.log("  app_id:", echoAppId || "(none — manual admin reply!)");
-                console.log("  our FACEBOOK_APP_ID:", ourAppId);
-                console.log("  text:", event.message.text || "(no text)");
 
-                // If echo has app_id matching OUR app, it's our bot's own reply — skip
-                if (echoAppId && String(echoAppId) === String(ourAppId)) {
-                    console.log("🤖 Echo from OUR bot — ignoring.");
-                    continue;
-                }
+                // Our bot's own echo — ignore
+                if (echoAppId && String(echoAppId) === String(ourAppId)) continue;
 
-                // Any other echo = admin manual reply (no app_id, or different app)
-                console.log("✅ ADMIN MANUAL REPLY CONFIRMED (not from our bot)");
-
+                // Admin manual reply
                 const echoPageId = String(entry.id);
                 const echoUserId = String(event.recipient.id);
-
-                console.log("🔍 DB lookup params:", { pageId: echoPageId, senderId: echoUserId });
-
-                // Debug: show all conversations for this page to find the right senderId
-                try {
-                    const allConvos = await Conversation.find({ pageId: echoPageId }).select('senderId humanActive lastHumanReplyAt').lean();
-                    console.log("📂 All conversations for this page:", JSON.stringify(allConvos, null, 2));
-                } catch (dbErr) {
-                    console.log("DB debug query error:", dbErr.message);
-                }
+                const adminText = event.message.text || "[attachment]";
 
                 try {
-                    const adminMessageText = event.message.text || "[attachment]";
                     const updated = await Conversation.findOneAndUpdate(
-                        {
-                            pageId: echoPageId,
-                            senderId: echoUserId,
-                        },
+                        { pageId: echoPageId, senderId: echoUserId },
                         {
                             humanActive: true,
                             lastHumanReplyAt: Date.now(),
                             $push: {
-                                messages: {
-                                    $each: [{ role: "admin", content: adminMessageText }],
-                                    $slice: -50,
-                                },
+                                messages: { $each: [{ role: "admin", content: adminText }], $slice: -50 },
                             },
                             $inc: { messageCount: 1 },
                         },
                         { new: true }
                     );
 
-                    if (!updated) {
-                        console.log("❌ Conversation NOT FOUND for takeover! No doc matches:", { pageId: echoPageId, senderId: echoUserId });
-                    } else {
-                        console.log("✅ Human takeover activated:", {
-                            _id: updated._id,
-                            pageId: updated.pageId,
-                            senderId: updated.senderId,
-                            humanActive: updated.humanActive,
-                            lastHumanReplyAt: updated.lastHumanReplyAt,
+                    if (updated) {
+                        // Dual-write to ConversationMessage
+                        await writeConversationMessage(updated, page, "admin", adminText);
+
+                        getIO()?.to(`page:${echoPageId}`).emit("new_message", {
+                            pageId: echoPageId,
+                            senderId: echoUserId,
+                            message: { role: "admin", content: adminText, timestamp: new Date() },
                         });
 
-                        // Update context story with admin message
                         try {
-                            const updatedStory = await updateContextStory(updated.contextStory, "admin", adminMessageText);
+                            const updatedStory = await updateContextStory(updated.contextStory, "admin", adminText);
                             await Conversation.findOneAndUpdate(
                                 { pageId: echoPageId, senderId: echoUserId },
                                 { $set: { contextStory: updatedStory } }
                             );
-                            console.log("📖 Context story updated with admin message");
-                        } catch (storyErr) {
-                            console.log("Context story update error (admin):", storyErr.message);
-                        }
+                        } catch (_) { }
                     }
-                } catch (htErr) {
-                    console.log("Human takeover update error:", htErr.message);
+                } catch (err) {
+                    console.log("Human takeover update error:", err.message);
                 }
                 continue;
             }
@@ -172,75 +198,54 @@ const handleIncomingMessage = async (req, res) => {
             const senderId = String(event.sender.id);
             const messageId = event.message.mid;
 
-            // --- Image attachment detection ---
-            const imageAttachment = event.message?.attachments?.find(
-                (a) => a.type === "image"
-            );
-
+            // Image attachment
+            const imageAttachment = event.message?.attachments?.find(a => a.type === "image");
             if (imageAttachment) {
                 const imageUrl = imageAttachment.payload?.url;
                 if (imageUrl) {
                     await handleImageMessage(senderId, imageUrl, page, pageId, messageId);
-                    continue;
                 }
+                continue;
             }
 
-            // Text-only guard (existing behavior)
             if (!event.message.text) continue;
 
             const userText = event.message.text;
-
             console.log(`[${page.pageName}] Message from ${senderId}: ${userText}`);
-            console.log("Types:", { pageIdType: typeof pageId, senderIdType: typeof senderId, pageId, senderId });
 
-            if (!page.aiEnabled) {
-                console.log("AI disabled for page:", page.pageName);
-                continue;
-            }
+            if (!page.aiEnabled) continue;
+            if (page.automationEnabled === false) continue;
 
-            if (page.planType === "free" && page.monthlyUsageCount >= page.monthlyLimit) {
-                console.log("Monthly limit reached for page:", page.pageId);
+            // ── Workspace quota check ─────────────────────────────────────
+            const allowed = await hasQuota(page);
+            if (!allowed) {
                 try {
-                    await sendMessage(page.pageAccessToken, senderId, "Your monthly AI message limit has been reached. Please upgrade your plan.");
-                } catch (limitErr) {
-                    console.log("Limit message error:", limitErr.response?.data || limitErr.message);
-                }
+                    await sendMessage(page.pageAccessToken, senderId, "Your monthly AI reply limit has been reached. Please upgrade your plan.");
+                } catch (_) { }
                 continue;
             }
 
-            // Fetch existing conversation and verify if profile fetch is needed
+            // ── Fetch / create conversation ───────────────────────────────
             let existingConvo = null;
             try {
                 existingConvo = await Conversation.findOne({ pageId, senderId });
-            } catch (err) {
-                console.log("Check existing convo error:", err.message);
-            }
+            } catch (_) { }
 
             try {
-                // Fetch profile if this is a new conversation
                 let profileUpdates = {};
-                if (!existingConvo || !existingConvo.profile?.name || existingConvo.profile.name === "Unknown User" || !existingConvo.profile?.profilePic) {
-                    console.log(`👤 Fetching profile for new sender ${senderId} on page ${pageId}`);
-                    const profileData = await fetchUserProfile(senderId, page.pageAccessToken);
-                    profileUpdates = {
-                        "profile.name": profileData.name,
-                        "profile.profilePic": profileData.profilePic
-                    };
+                if (!existingConvo?.profile?.name || existingConvo.profile.name === "Unknown User" || !existingConvo?.profile?.profilePic) {
+                    const profile = await fetchUserProfile(senderId, page.pageAccessToken);
+                    profileUpdates = { "profile.name": profile.name, "profile.profilePic": profile.profilePic };
                 }
 
-                // 1. Save user message BEFORE calling OpenAI
                 const updateDoc = {
-                    $push: {
-                        messages: {
-                            $each: [{ role: "user", content: userText }],
-                            $slice: -50,
-                        },
-                    },
+                    $push: { messages: { $each: [{ role: "user", content: userText }], $slice: -50 } },
                     $inc: { messageCount: 1 },
                     lastMessageAt: Date.now(),
                 };
-                if (Object.keys(profileUpdates).length > 0) {
-                    updateDoc.$set = profileUpdates;
+                if (Object.keys(profileUpdates).length > 0) updateDoc.$set = profileUpdates;
+                if (page.workspaceId && !existingConvo?.workspaceId) {
+                    updateDoc.$set = { ...(updateDoc.$set || {}), workspaceId: page.workspaceId };
                 }
 
                 const conversation = await Conversation.findOneAndUpdate(
@@ -249,107 +254,62 @@ const handleIncomingMessage = async (req, res) => {
                     { new: true, upsert: true }
                 );
 
+                // Dual-write user message to ConversationMessage
+                await writeConversationMessage(conversation, page, "user", userText);
 
-                // ==== DEBUG: Verify message storage ====
-                console.log("==== DEBUG: MESSAGE STORAGE ====");
-                console.log("Conversation ID:", conversation._id);
-                console.log("Total messages in DB:", conversation.messages.length);
-                console.log("Message count field:", conversation.messageCount);
-                console.log("Context story:", conversation.contextStory || "(empty)");
-                console.log("Last 5 stored messages:", conversation.messages.slice(-5).map(m => `${m.role}: ${m.content.substring(0, 60)}`));
-                console.log("================================");
+                getIO()?.to(`page:${pageId}`).emit("new_message", {
+                    pageId, senderId,
+                    message: { role: "user", content: userText, timestamp: new Date() },
+                });
 
-                // Enforce AI Skip Toggles BEFORE further processing
-                if (conversation.humanActive) {
-                    console.log(`🚫 Human Active is ON for sender ${senderId}. Skipping AI reply.`);
-                    continue;
-                }
-                if (conversation.aiEnabled === false) {
-                    console.log(`🚫 AI is explicitly disabled for sender ${senderId}. Skipping AI reply.`);
-                    continue;
-                }
+                if (conversation.humanActive) continue;
+                if (conversation.aiEnabled === false) continue;
 
-                // 2. Memory extraction — detect and store user-provided facts
+                // Memory extraction
                 const nameMatch = userText.match(/my name is ([\w\s]+)/i);
                 if (nameMatch) {
                     const extractedName = nameMatch[1].trim();
-                    await Conversation.findOneAndUpdate(
-                        { pageId, senderId },
-                        { $set: { "profile.name": extractedName } }
-                    );
+                    await Conversation.findOneAndUpdate({ pageId, senderId }, { $set: { "profile.name": extractedName } });
                     conversation.profile = { ...conversation.profile, name: extractedName };
-                    console.log(`📝 Extracted user profile:`, { name: extractedName });
                 }
 
-                // 2.2 Sync admin messages from Facebook Conversations API
-                // (Echo events often don't arrive, so we fetch directly)
+                // Sync admin messages from Facebook Conversations API
                 try {
                     const convoRes = await axios.get(
                         `https://graph.facebook.com/v19.0/${pageId}/conversations`,
-                        {
-                            params: {
-                                access_token: page.pageAccessToken,
-                                user_id: senderId,
-                                fields: "messages{message,from,created_time}",
-                            },
-                        }
+                        { params: { access_token: page.pageAccessToken, user_id: senderId, fields: "messages{message,from,created_time}" } }
                     );
-
                     const thread = convoRes.data?.data?.[0];
                     if (thread?.messages?.data?.length > 0) {
-                        // Get recent page-sent messages (admin replies)
-                        const recentFbMessages = thread.messages.data.slice(0, 10); // newest first
-                        const adminMessages = recentFbMessages.filter(m => String(m.from?.id) === pageId && m.message);
-
-                        // Get existing message contents to avoid duplicates
-                        const existingContents = new Set(
-                            conversation.messages.map(m => m.content)
-                        );
-
-                        // Find admin messages not already stored
+                        const adminMessages = thread.messages.data
+                            .slice(0, 10)
+                            .filter(m => String(m.from?.id) === pageId && m.message);
+                        const existingContents = new Set(conversation.messages.map(m => m.content));
                         const newAdminMessages = adminMessages.filter(m => !existingContents.has(m.message));
 
                         if (newAdminMessages.length > 0) {
-                            console.log(`📥 Syncing ${newAdminMessages.length} admin messages from Facebook API`);
-
-                            // Push missing admin messages to DB
                             const adminDocs = newAdminMessages.map(m => ({
                                 role: "admin",
                                 content: m.message,
                                 timestamp: new Date(m.created_time),
                             }));
-
                             await Conversation.findOneAndUpdate(
                                 { pageId, senderId },
-                                {
-                                    $push: {
-                                        messages: {
-                                            $each: adminDocs,
-                                            $slice: -50,
-                                        },
-                                    },
-                                }
+                                { $push: { messages: { $each: adminDocs, $slice: -50 } } }
                             );
-
-                            // Re-fetch conversation with synced messages
-                            const updatedConvo = await Conversation.findOne({ pageId, senderId });
-                            conversation.messages = updatedConvo.messages;
-                            console.log("✅ Admin messages synced. Total messages now:", conversation.messages.length);
+                            const refreshed = await Conversation.findOne({ pageId, senderId });
+                            conversation.messages = refreshed.messages;
                         }
                     }
-                } catch (syncErr) {
-                    console.log("⚠️ Admin message sync failed (non-blocking):", syncErr.response?.data?.error?.message || syncErr.message);
-                }
+                } catch (_) { }
 
-                // 2.5 Check for image context — if user is asking about a recently analyzed image
+                // Image context expiry
                 let hasImageContext = false;
-
                 if (conversation.lastImageContext && conversation.lastImageTimestamp) {
                     const imageAge = Date.now() - new Date(conversation.lastImageTimestamp).getTime();
                     if (imageAge < 5 * 60 * 1000) {
                         hasImageContext = true;
                     } else {
-                        // Expired — clear image context
                         await Conversation.findOneAndUpdate(
                             { pageId, senderId },
                             { $set: { lastImageContext: null, lastImageTimestamp: null } }
@@ -357,235 +317,115 @@ const handleIncomingMessage = async (req, res) => {
                     }
                 }
 
-                let response;
-                let aiLatency;
+                // ── Build AI messages ─────────────────────────────────────
+                const sortedMessages = [...conversation.messages].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+                const priorMessages = sortedMessages.slice(-6, -1);
+                const adminDirectives = priorMessages.filter(m => m.role === "admin").map(m => m.content);
+                const conversationMessages = priorMessages.filter(m => m.role !== "admin").map(m => ({ role: m.role, content: m.content }));
 
-                {
-                    // Normal text flow
-                    // 3. Get last 5 messages for context
-                    const sortedMessages = [...conversation.messages]
-                        .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+                const dynamicPrompt = buildDynamicPrompt(page);
+                const openaiMessages = [{ role: "system", content: dynamicPrompt }];
 
-                    // Take last 5 messages (excluding the current user message we just pushed)
-                    const priorMessages = sortedMessages.slice(-6, -1);
-
-                    // Separate admin directives
-                    const adminDirectives = priorMessages
-                        .filter(m => m.role === "admin")
-                        .map(m => m.content);
-
-                    // Filter out admin messages from conversation history for cleaner API payload
-                    const conversationMessages = priorMessages
-                        .filter(m => m.role !== "admin")
-                        .map(m => ({ role: m.role, content: m.content }));
-
-                    // 4. Build system prompt
-                    const dynamicPrompt = buildDynamicPrompt(page);
-
-                    // 5. Build messages array
-                    const openaiMessages = [
-                        { role: "system", content: dynamicPrompt },
-                    ];
-
-                    // INSTRUCTIONS & RULES
-                    try {
-                        const instructionDoc = await PageInstruction.findOne({ pageId });
-                        
-                        // 1. Core Business Rules (Always Mandated)
-                        const coreRules = [
-                            "You are replying on behalf of the Facebook page owner.",
-                            "Follow page instructions strictly.",
-                            "Do not invent business information."
-                        ];
-                        
-                        openaiMessages.push({
-                            role: "system",
-                            content: `Core Business Rules:\n${coreRules.join("\n")}`,
-                        });
-
-                        // 2. Page Specific Instructions (Full & Active)
-                        if (instructionDoc) {
-                            const activeInstructions = instructionDoc.instructions
-                                .filter(i => i.isActive)
-                                .map(i => i.text);
-                            
-                            if (activeInstructions.length > 0) {
-                                openaiMessages.push({
-                                    role: "system",
-                                    content: `Page Instructions:\n${activeInstructions.join("\n")}`,
-                                });
-                            }
+                try {
+                    const instructionDoc = await PageInstruction.findOne({ pageId });
+                    openaiMessages.push({
+                        role: "system",
+                        content: `Core Business Rules:\nYou are replying on behalf of the Facebook page owner.\nFollow page instructions strictly.\nDo not invent business information.`,
+                    });
+                    if (instructionDoc) {
+                        const active = instructionDoc.instructions.filter(i => i.isActive).map(i => i.text);
+                        if (active.length > 0) {
+                            openaiMessages.push({ role: "system", content: `Page Instructions:\n${active.join("\n")}` });
                         }
-
-                        // 3. Conversation Summary (Rolling Context)
-                        if (conversation.contextStory) {
-                            openaiMessages.push({
-                                role: "system",
-                                content: `Summary: ${conversation.contextStory}`,
-                            });
-                        }
-                    } catch (instrErr) {
-                        console.log("Instruction restoration error:", instrErr.message);
                     }
-
-                    // Inject known user info
-                    const memoryContext = buildMemoryContext(conversation.profile);
-                    if (memoryContext) {
-                        openaiMessages.push({ role: "system", content: memoryContext });
+                    if (conversation.contextStory) {
+                        openaiMessages.push({ role: "system", content: `Summary: ${conversation.contextStory}` });
                     }
+                } catch (_) { }
 
-                    // Inject image analysis summary if fresh
-                    if (hasImageContext) {
-                        openaiMessages.push({
-                            role: "system",
-                            content: `Image context: ${conversation.lastImageContext}`,
-                        });
-                    }
-
-                    // RECENT MESSAGES (Last 5)
-                    if (conversationMessages.length > 0) {
-                        openaiMessages.push(...conversationMessages);
-                    }
-
-                    // ACTIVE MODERATOR DIRECTIVES
-                    if (adminDirectives.length > 0) {
-                        openaiMessages.push({
-                            role: "system",
-                            content: `Moderator Instructions: ${adminDirectives.join(" ")}`,
-                        });
-                    }
-
-                    // CURRENT USER MESSAGE
-                    openaiMessages.push({ role: "user", content: userText });
-
-                    const aiStart = Date.now();
-                    response = await generateAIReply(userText, dynamicPrompt, openaiMessages);
-                    aiLatency = Date.now() - aiStart;
+                const memCtx = buildMemoryContext(conversation.profile);
+                if (memCtx) openaiMessages.push({ role: "system", content: memCtx });
+                if (hasImageContext) {
+                    openaiMessages.push({ role: "system", content: `Image context: ${conversation.lastImageContext}` });
                 }
+                if (conversationMessages.length > 0) openaiMessages.push(...conversationMessages);
+                if (adminDirectives.length > 0) {
+                    openaiMessages.push({ role: "system", content: `Moderator Instructions: ${adminDirectives.join(" ")}` });
+                }
+                openaiMessages.push({ role: "user", content: userText });
+
+                const aiStart = Date.now();
+                const response = await generateAIReply(userText, dynamicPrompt, openaiMessages);
+                const aiLatency = Date.now() - aiStart;
 
                 const aiReply = response.reply;
                 const inputTokens = response.usage?.prompt_tokens || 0;
                 const outputTokens = response.usage?.completion_tokens || 0;
                 const totalTokens = response.usage?.total_tokens || 0;
-                const estimatedCost =
-                    (inputTokens / 1000) * 0.005 +
-                    (outputTokens / 1000) * 0.015;
+                const estimatedCost = (inputTokens / 1000) * 0.005 + (outputTokens / 1000) * 0.015;
 
                 console.log(`AI reply (${aiLatency}ms):`, aiReply.substring(0, 100));
-                console.log("Tokens:", { inputTokens, outputTokens, totalTokens, estimatedCost });
 
+                // Save AI reply to conversation (backward compat embedded array)
                 await Conversation.findOneAndUpdate(
                     { pageId, senderId },
                     {
-                        $push: {
-                            messages: {
-                                $each: [{ role: "assistant", content: aiReply }],
-                                $slice: -50,
-                            },
-                        },
+                        $push: { messages: { $each: [{ role: "assistant", content: aiReply }], $slice: -50 } },
                         $inc: { messageCount: 1 },
-                        $set: { lastAiReplyAt: Date.now() }
+                        $set: { lastAiReplyAt: Date.now() },
                     }
                 );
 
+                // Dual-write to ConversationMessage (new scalable storage)
+                await writeConversationMessage(conversation, page, "assistant", aiReply, { inputTokens, outputTokens, totalTokens, estimatedCost });
 
-                // Emotion-aware selective reaction
+                getIO()?.to(`page:${pageId}`).emit("new_message", {
+                    pageId, senderId,
+                    message: { role: "assistant", content: aiReply, timestamp: new Date() },
+                });
+
+                // Emotion reaction
                 const emotion = detectEmotion(userText);
                 const { shouldReact, emoji } = getReactionForEmotion(emotion);
-
                 if (shouldReact && messageId) {
-                    try {
-                        await addReaction(page.pageAccessToken, senderId, messageId, emoji);
-                    } catch (_) { }
+                    try { await addReaction(page.pageAccessToken, senderId, messageId, emoji); } catch (_) { }
                 }
 
+                try { await markSeen(page.pageAccessToken, senderId); } catch (_) { }
+                await new Promise(r => setTimeout(r, 2500));
+                try { await showTyping(page.pageAccessToken, senderId); } catch (_) { }
+
+                const typingDelay = Math.min(6000, Math.max(1800, aiReply.length * 35 + Math.floor(Math.random() * 600)));
+                await new Promise(r => setTimeout(r, typingDelay));
+
+                // Pre-send admin takeover check
                 try {
-                    await markSeen(page.pageAccessToken, senderId);
-                    console.log("👁️ Marked seen");
-                } catch (seenErr) {
-                    console.log("Mark seen error:", seenErr.response?.data || seenErr.message);
-                }
-
-                // Pause before typing (simulates reading the message)
-                await new Promise(resolve => setTimeout(resolve, 2500));
-                console.log("⏳ Starting typing indicator");
-
-                try {
-                    await showTyping(page.pageAccessToken, senderId);
-                    console.log("⌨️ Typing started");
-                } catch (typingErr) {
-                    console.log("Typing indicator error:", typingErr.response?.data || typingErr.message);
-                }
-
-                // Human-like typing delay: scales with length + random variance
-                const baseDelay = aiReply.length * 35;
-                const randomVariance = Math.floor(Math.random() * 600);
-                const typingDelay = Math.min(6000, Math.max(1800, baseDelay + randomVariance));
-                console.log(`⏱️ Typing for ${typingDelay}ms (base: ${baseDelay}, variance: ${randomVariance})`);
-                await new Promise(resolve => setTimeout(resolve, typingDelay));
-
-                // Pre-send check: Query Facebook Conversations API to detect admin replies
-                // This runs right before sending, maximizing window for admin detection
-                try {
-                    const convoRes = await axios.get(
+                    const checkRes = await axios.get(
                         `https://graph.facebook.com/v19.0/${pageId}/conversations`,
-                        {
-                            params: {
-                                access_token: page.pageAccessToken,
-                                user_id: senderId,
-                                fields: "messages{message,from,created_time}",
-                            },
-                        }
+                        { params: { access_token: page.pageAccessToken, user_id: senderId, fields: "messages{message,from,created_time}" } }
                     );
-
-                    const thread = convoRes.data?.data?.[0];
+                    const thread = checkRes.data?.data?.[0];
                     if (thread?.messages?.data?.length > 0) {
-                        const latestMsg = thread.messages.data[0]; // most recent message
-                        const latestFrom = String(latestMsg.from?.id);
-                        const latestText = latestMsg.message;
-                        const latestTime = new Date(latestMsg.created_time).getTime();
-                        const timeDiff = Date.now() - latestTime;
-
-                        console.log("📋 Facebook thread latest message:", {
-                            from: latestFrom,
-                            pageId,
-                            isFromPage: latestFrom === pageId,
-                            text: latestText?.substring(0, 50),
-                            ageMs: timeDiff,
-                        });
-
-                        // If latest message is FROM the page, NOT our AI reply, and recent (< 60s)
-                        if (latestFrom === pageId && latestText !== aiReply && timeDiff < 60000) {
-                            console.log("🚫 Admin already replied! Cancelling AI reply.");
-
-                            // Set human takeover in DB
-                            await Conversation.findOneAndUpdate(
-                                { pageId, senderId },
-                                { humanActive: true, lastHumanReplyAt: Date.now() }
-                            );
-                            console.log("🧑 Human takeover activated via API check.");
+                        const latest = thread.messages.data[0];
+                        const latestFrom = String(latest.from?.id);
+                        const timeDiff = Date.now() - new Date(latest.created_time).getTime();
+                        if (latestFrom === pageId && latest.message !== aiReply && timeDiff < 60000) {
+                            await Conversation.findOneAndUpdate({ pageId, senderId }, { humanActive: true, lastHumanReplyAt: Date.now() });
+                            console.log("🚫 Admin already replied — cancelling AI reply");
                             continue;
                         }
                     }
-                } catch (apiCheckErr) {
-                    console.log("⚠️ Facebook conversation check failed (non-blocking):", apiCheckErr.response?.data?.error?.message || apiCheckErr.message);
-                    // Non-blocking: if API check fails, proceed with AI reply
-                }
-
-                // Also re-check humanActive in DB (in case echo arrived during processing)
-                try {
-                    const freshConvo = await Conversation.findOne({ pageId, senderId });
-                    if (freshConvo?.humanActive) {
-                        console.log("🚫 Human takeover detected via echo. Cancelling AI reply.");
-                        continue;
-                    }
                 } catch (_) { }
 
-                const sendStart = Date.now();
-                const sendResult = await sendMessage(page.pageAccessToken, senderId, aiReply, messageId);
-                const sendLatency = Date.now() - sendStart;
-                console.log(`✅ Reply sent after ${2500 + typingDelay + sendLatency}ms (read: 2500ms, typing: ${typingDelay}ms, send: ${sendLatency}ms):`, JSON.stringify(sendResult));
+                // Final humanActive re-check
+                try {
+                    const fresh = await Conversation.findOne({ pageId, senderId });
+                    if (fresh?.humanActive) { console.log("🚫 Human takeover via echo — cancelling"); continue; }
+                } catch (_) { }
 
+                await sendMessage(page.pageAccessToken, senderId, aiReply, messageId);
+
+                // Legacy MessageLog (kept for admin analytics backward compat)
                 try {
                     await MessageLog.create({
                         userId: page.userId,
@@ -598,173 +438,128 @@ const handleIncomingMessage = async (req, res) => {
                         totalTokens,
                         estimatedCost,
                     });
-                } catch (logErr) {
-                    console.log("Message log error:", logErr.message);
-                }
+                } catch (_) { }
 
-                try {
-                    page.totalMessages += 1;
-                    page.totalAIReplies += 1;
-                    page.monthlyUsageCount += 1;
-                    await page.save();
-                } catch (usageErr) {
-                    console.log("Usage update error:", usageErr.message);
-                }
+                // Increment workspace + page usage counters
+                await incrementUsage(page, { inputTokens, outputTokens, totalTokens, estimatedCost });
 
-                // 6. Unified Context Update (Rolling summary) - Occurs once after reply
+                // Rolling context summary
                 try {
                     const exchange = `User: ${userText}\nAI: ${aiReply}`;
                     const updatedStory = await updateContextStory(conversation.contextStory, "assistant", exchange);
-                    await Conversation.findOneAndUpdate(
-                        { pageId, senderId },
-                        { $set: { contextStory: updatedStory } }
-                    );
-                    console.log("📖 Rolling summary updated after AI reply");
-                } catch (storyErr) {
-                    console.log("Rolling summary update error:", storyErr.message);
-                }
+                    await Conversation.findOneAndUpdate({ pageId, senderId }, { $set: { contextStory: updatedStory } });
+                } catch (_) { }
+
             } catch (err) {
                 console.log("AI/Send error:", err.response?.data || err.message);
                 try {
-                    // Still show human-like behavior on error
                     try { await markSeen(page.pageAccessToken, senderId); } catch (_) { }
-                    await new Promise(resolve => setTimeout(resolve, 2500));
+                    await new Promise(r => setTimeout(r, 2500));
                     try { await showTyping(page.pageAccessToken, senderId); } catch (_) { }
-                    const fallbackDelay = 1800 + Math.floor(Math.random() * 600);
-                    await new Promise(resolve => setTimeout(resolve, fallbackDelay));
+                    await new Promise(r => setTimeout(r, 1800));
                     await sendMessage(page.pageAccessToken, senderId, "Sorry, please try again later.", messageId);
-                } catch (fallbackErr) {
-                    console.log("Fallback error:", fallbackErr.response?.data || fallbackErr.message);
-                }
+                } catch (_) { }
             }
         }
     }
 };
 
-/**
- * Handle an incoming image message using OpenAI vision.
- * @param {string} senderId - The Facebook user ID
- * @param {string} imageUrl - The URL of the image attachment
- * @param {object} page - The Page document from the database
- * @param {string} pageId - The Facebook page ID
- */
-const handleImageMessage = async (senderId, imageUrl, page, pageId, messageId) => {
-    if (!page.aiEnabled) return;
+// ─── Image Message Handler ────────────────────────────────────────────────────
 
-    if (page.planType === "free" && page.monthlyUsageCount >= page.monthlyLimit) {
-        try {
-            await sendMessage(page.pageAccessToken, senderId, "Your monthly AI message limit has been reached. Please upgrade your plan.");
-        } catch (limitErr) {
-            console.log("Limit message error:", limitErr.response?.data || limitErr.message);
-        }
+const handleImageMessage = async (senderId, imageUrl, page, pageId, messageId) => {
+    if (!page.aiEnabled || page.automationEnabled === false) return;
+
+    const allowed = await hasQuota(page);
+    if (!allowed) {
+        try { await sendMessage(page.pageAccessToken, senderId, "Your monthly AI reply limit has been reached."); } catch (_) { }
         return;
     }
 
     try {
-        const existingConvoImage = await Conversation.findOne({ pageId, senderId });
-        let profileUpdatesImage = {};
-        if (!existingConvoImage || !existingConvoImage.profile?.name || existingConvoImage.profile.name === "Unknown User" || !existingConvoImage.profile?.profilePic) {
-            console.log(`🖼️👤 Fetching profile for new sender ${senderId} on page ${pageId} (Image Message)`);
-            const profileData = await fetchUserProfile(senderId, page.pageAccessToken);
-            profileUpdatesImage = {
-                "profile.name": profileData.name,
-                "profile.profilePic": profileData.profilePic
-            };
+        const existingConvo = await Conversation.findOne({ pageId, senderId });
+        let profileUpdates = {};
+        if (!existingConvo?.profile?.name || existingConvo.profile.name === "Unknown User") {
+            const profile = await fetchUserProfile(senderId, page.pageAccessToken);
+            profileUpdates = { "profile.name": profile.name, "profile.profilePic": profile.profilePic };
         }
 
-        // 1. Fetch conversation to get contextStory and save user message
-        const updateDocImage = {
-            $push: {
-                messages: {
-                    $each: [{ role: "user", content: "[Image]" }],
-                    $slice: -50,
-                },
-            },
+        const updateDoc = {
+            $push: { messages: { $each: [{ role: "user", content: "[Image]" }], $slice: -50 } },
             $inc: { messageCount: 1 },
             lastMessageAt: Date.now(),
+            $set: { lastImageTimestamp: Date.now(), ...(Object.keys(profileUpdates).length ? profileUpdates : {}) },
         };
-
-        let initialSet = { lastImageTimestamp: Date.now() };
-        if (Object.keys(profileUpdatesImage).length > 0) {
-            initialSet = { ...initialSet, ...profileUpdatesImage };
-        }
-        updateDocImage.$set = initialSet;
 
         const conversation = await Conversation.findOneAndUpdate(
             { pageId, senderId },
-            updateDocImage,
+            updateDoc,
             { new: true, upsert: true }
         );
 
-        if (conversation.humanActive) {
-            console.log(`🖼️🚫 Human Active is ON for sender ${senderId}. Skipping AI image reply.`);
-            return;
-        }
-        if (conversation.aiEnabled === false) {
-            console.log(`🖼️🚫 AI is explicitly disabled for sender ${senderId}. Skipping AI image reply.`);
-            return;
-        }
+        await writeConversationMessage(conversation, page, "user", "[Image]", { attachmentType: "image" });
 
-        // 2. Analyze image — get plain text description
+        getIO()?.to(`page:${pageId}`).emit("new_message", {
+            pageId, senderId,
+            message: { role: "user", content: "[Image]", timestamp: new Date() },
+        });
+
+        if (conversation.humanActive || conversation.aiEnabled === false) return;
+
         const response = await analyzeImage(imageUrl);
         const imageDescription = response.reply;
         const inputTokens = response.usage?.prompt_tokens || 0;
         const outputTokens = response.usage?.completion_tokens || 0;
         const totalTokens = response.usage?.total_tokens || 0;
-        const estimatedCost =
-            (inputTokens / 1000) * 0.005 + (outputTokens / 1000) * 0.015;
+        const estimatedCost = (inputTokens / 1000) * 0.005 + (outputTokens / 1000) * 0.015;
 
-        console.log("🖼️ Image analyzed:", imageDescription.substring(0, 100));
-
-        // Update with image context
         await Conversation.findOneAndUpdate(
             { pageId, senderId },
             { $set: { lastImageContext: imageDescription } }
         );
 
-        const contextStory = conversation.contextStory || "";
-
-        // 3. Classify image intent using contextStory + description
-        const intent = await classifyImageIntent(contextStory, imageDescription);
-        console.log("🏷️ Image intent classified:", intent);
-
-        // 4. Generate context-aware reply based on intent
-        const replyResponse = await generateImageReply(contextStory, imageDescription, intent, page);
+        const intent = await classifyImageIntent(conversation.contextStory || "", imageDescription);
+        const replyResponse = await generateImageReply(conversation.contextStory || "", imageDescription, intent, page);
         const aiReply = replyResponse.reply;
         const replyInputTokens = replyResponse.usage?.prompt_tokens || 0;
         const replyOutputTokens = replyResponse.usage?.completion_tokens || 0;
         const replyTotalTokens = replyResponse.usage?.total_tokens || 0;
-        const replyEstimatedCost =
-            (replyInputTokens / 1000) * 0.005 + (replyOutputTokens / 1000) * 0.015;
+        const replyEstimatedCost = (replyInputTokens / 1000) * 0.005 + (replyOutputTokens / 1000) * 0.015;
 
-        console.log(`🖼️ Image reply (${intent}):`, aiReply.substring(0, 100));
+        const totalIn = inputTokens + replyInputTokens;
+        const totalOut = outputTokens + replyOutputTokens;
+        const totalTok = totalTokens + replyTotalTokens;
+        const totalCost = estimatedCost + replyEstimatedCost;
 
-        // 5. Save AI reply to conversation
         await Conversation.findOneAndUpdate(
             { pageId, senderId },
             {
-                $push: {
-                    messages: {
-                        $each: [{ role: "assistant", content: aiReply }],
-                        $slice: -50,
-                    },
-                },
+                $push: { messages: { $each: [{ role: "assistant", content: aiReply }], $slice: -50 } },
                 $inc: { messageCount: 1 },
-                $set: { lastAiReplyAt: Date.now() }
+                $set: { lastAiReplyAt: Date.now() },
             }
         );
 
+        await writeConversationMessage(conversation, page, "assistant", aiReply, {
+            inputTokens: totalIn,
+            outputTokens: totalOut,
+            totalTokens: totalTok,
+            estimatedCost: totalCost,
+            attachmentType: "image",
+        });
 
-        // 7. Human-like reply flow
+        getIO()?.to(`page:${pageId}`).emit("new_message", {
+            pageId, senderId,
+            message: { role: "assistant", content: aiReply, timestamp: new Date() },
+        });
+
         try { await markSeen(page.pageAccessToken, senderId); } catch (_) { }
-        await new Promise((resolve) => setTimeout(resolve, 2500));
+        await new Promise(r => setTimeout(r, 2500));
         try { await showTyping(page.pageAccessToken, senderId); } catch (_) { }
         const typingDelay = Math.min(5000, Math.max(1800, aiReply.length * 35 + Math.floor(Math.random() * 600)));
-        await new Promise((resolve) => setTimeout(resolve, typingDelay));
+        await new Promise(r => setTimeout(r, typingDelay));
 
         await sendMessage(page.pageAccessToken, senderId, aiReply, messageId);
 
-        // 8. Log the message
         try {
             await MessageLog.create({
                 userId: page.userId,
@@ -772,45 +567,30 @@ const handleImageMessage = async (senderId, imageUrl, page, pageId, messageId) =
                 senderId,
                 messageText: `[Image: ${intent}]`,
                 aiReply,
-                inputTokens: inputTokens + replyInputTokens,
-                outputTokens: outputTokens + replyOutputTokens,
-                totalTokens: totalTokens + replyTotalTokens,
-                estimatedCost: estimatedCost + replyEstimatedCost,
+                inputTokens: totalIn,
+                outputTokens: totalOut,
+                totalTokens: totalTok,
+                estimatedCost: totalCost,
             });
-        } catch (logErr) {
-            console.log("Image message log error:", logErr.message);
-        }
+        } catch (_) { }
 
-        // 9. Update usage counters
-        try {
-            await page.save();
-        } catch (usageErr) {
-            console.log("Usage update error:", usageErr.message);
-        }
+        await incrementUsage(page, { inputTokens: totalIn, outputTokens: totalOut, totalTokens: totalTok, estimatedCost: totalCost });
 
-        // 10. Unified Context Update (Rolling summary) - Occurs once after reply
         try {
             const exchange = `User: [Sent an image classified as ${intent}] ${imageDescription.substring(0, 100)}\nAI: ${aiReply}`;
-            const updatedStory = await updateContextStory(contextStory, "assistant", exchange);
-            await Conversation.findOneAndUpdate(
-                { pageId, senderId },
-                { $set: { contextStory: updatedStory } }
-            );
-            console.log("📖 Image rolling summary updated");
-        } catch (storyErr) {
-            console.log("Image rolling summary update error:", storyErr.message);
-        }
+            const updatedStory = await updateContextStory(conversation.contextStory || "", "assistant", exchange);
+            await Conversation.findOneAndUpdate({ pageId, senderId }, { $set: { contextStory: updatedStory } });
+        } catch (_) { }
+
     } catch (err) {
         console.log("Image analysis error:", err.response?.data || err.message);
         try {
             try { await markSeen(page.pageAccessToken, senderId); } catch (_) { }
-            await new Promise((resolve) => setTimeout(resolve, 2500));
+            await new Promise(r => setTimeout(r, 2500));
             try { await showTyping(page.pageAccessToken, senderId); } catch (_) { }
-            await new Promise((resolve) => setTimeout(resolve, 1800));
+            await new Promise(r => setTimeout(r, 1800));
             await sendMessage(page.pageAccessToken, senderId, "I couldn't analyze the image. Please try again.", messageId);
-        } catch (fallbackErr) {
-            console.log("Image fallback error:", fallbackErr.response?.data || fallbackErr.message);
-        }
+        } catch (_) { }
     }
 };
 

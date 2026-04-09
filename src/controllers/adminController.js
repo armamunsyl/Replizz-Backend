@@ -2,10 +2,12 @@ import User from "../models/User.js";
 import Page from "../models/Page.js";
 import MessageLog from "../models/MessageLog.js";
 import Conversation from "../models/Conversation.js";
+import Workspace from "../models/Workspace.js";
+import WorkspaceMember from "../models/WorkspaceMember.js";
 import admin from "../config/firebaseAdmin.js";
 
 // ─── GET /api/admin/users ───
-const getAllUsers = async (req, res, next) => {
+const getAllUsers = async (_req, res, next) => {
     try {
         const users = await User.find()
             .select("-passwordHash")
@@ -41,15 +43,13 @@ const getAllUsers = async (req, res, next) => {
             const uid = emailToUid[(user.email || "").toLowerCase()];
             const userPages = uid ? (pagesByUid[uid] || []) : [];
 
-            // Determine plan based on highest page plan, or default to free
-            const isPro = userPages.some(p => p.planType === 'pro');
-            const plan = isPro ? 'pro' : 'free';
-
-            return {
+                return {
                 ...user,
                 uid: uid || null,
                 pages: userPages,
-                planType: plan
+                planType: user.planType || 'free',
+                messageLimit: user.messageLimit || 100,
+                usedMessages: user.usedMessages || 0,
             };
         });
 
@@ -109,12 +109,27 @@ const deleteUser = async (req, res, next) => {
 };
 
 // ─── GET /api/admin/analytics ───
-const getAnalytics = async (req, res, next) => {
+const getAnalytics = async (_req, res, next) => {
     try {
-        const [userCount, pageCount, conversationCount, messageStats] = await Promise.all([
+        const [
+            userCount,
+            pageCount,
+            activePageCount,
+            conversationCount,
+            workspaceCount,
+            workspacePlanDist,
+            memberCount,
+            messageStats,
+        ] = await Promise.all([
             User.countDocuments(),
             Page.countDocuments(),
+            Page.countDocuments({ isActive: true }),
             Conversation.countDocuments(),
+            Workspace.countDocuments(),
+            Workspace.aggregate([
+                { $group: { _id: "$planCode", count: { $sum: 1 } } },
+            ]),
+            WorkspaceMember.countDocuments(),
             MessageLog.aggregate([
                 {
                     $group: {
@@ -138,12 +153,21 @@ const getAnalytics = async (req, res, next) => {
         };
         delete stats._id;
 
+        const planDistribution = { free: 0, standard: 0, pro: 0, custom: 0 };
+        workspacePlanDist.forEach(p => {
+            if (planDistribution[p._id] !== undefined) planDistribution[p._id] = p.count;
+        });
+
         res.json({
             success: true,
             data: {
                 userCount,
                 pageCount,
+                activePageCount,
                 conversationCount,
+                workspaceCount,
+                memberCount,
+                planDistribution,
                 ...stats,
             },
         });
@@ -168,7 +192,7 @@ const getReports = async (req, res, next) => {
 };
 
 // ─── GET /api/admin/pages ───
-const getAllPages = async (req, res, next) => {
+const getAllPages = async (_req, res, next) => {
     try {
         const pages = await Page.find()
             .select("-pageAccessToken")
@@ -181,37 +205,24 @@ const getAllPages = async (req, res, next) => {
     }
 };
 
-// ─── PUT /api/admin/pages/:pageId/plan ───
-const updatePagePlan = async (req, res, next) => {
-    try {
-        const { planType, monthlyLimit } = req.body;
-        
-        if (!["free", "pro"].includes(planType)) {
-            return res.status(400).json({ success: false, message: "Invalid plan type. Must be 'free' or 'pro'" });
-        }
-
-        const limitNum = parseInt(monthlyLimit, 10);
-        if (isNaN(limitNum) || limitNum < 0) {
-            return res.status(400).json({ success: false, message: "Invalid monthly limit" });
-        }
-
-        const page = await Page.findOneAndUpdate(
-            { pageId: req.params.pageId },
-            { 
-                planType, 
-                monthlyLimit: limitNum 
-            },
-            { new: true }
-        ).select("-pageAccessToken");
-
-        if (!page) {
-            return res.status(404).json({ success: false, message: "Page not found" });
-        }
-
-        res.json({ success: true, data: page });
-    } catch (error) {
-        next(error);
-    }
+// ─── PUT /api/admin/pages/:pageId/plan — REMOVED ───
+// Page-level plan ownership is gone. Plans live on Workspace.
+// Use PUT /api/admin/workspaces/:id/plan instead.
+const updatePagePlan = (_req, res) => {
+    res.status(410).json({
+        success: false,
+        message: "Page-level plans have been removed. Use PUT /api/admin/workspaces/:id/plan to manage workspace plans.",
+    });
 };
 
-export { getAllUsers, updateUserRole, deleteUser, getAnalytics, getReports, getAllPages, updatePagePlan };
+// ─── PUT /api/admin/users/:id/plan — REMOVED ───
+// User-level plan ownership is gone. Plans live on Workspace.
+// Use PUT /api/admin/workspaces/:id/plan instead.
+const updateUserPlan = (_req, res) => {
+    res.status(410).json({
+        success: false,
+        message: "User-level plans have been removed. Use PUT /api/admin/workspaces/:id/plan to manage workspace plans.",
+    });
+};
+
+export { getAllUsers, updateUserRole, deleteUser, getAnalytics, getReports, getAllPages, updatePagePlan, updateUserPlan };

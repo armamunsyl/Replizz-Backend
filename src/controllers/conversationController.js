@@ -1,35 +1,60 @@
 import Conversation from "../models/Conversation.js";
+import ConversationMessage from "../models/ConversationMessage.js";
 import Page from "../models/Page.js";
+
+// ─── Helper ───────────────────────────────────────────────────────────────────
+// Verify a page belongs to the current workspace.
+const verifyPageOwnership = async (pageId, workspaceId) => {
+    if (!workspaceId) return null;
+    return Page.findOne({ pageId, workspaceId, isActive: true }).lean();
+};
 
 // GET /api/conversations/:pageId — list conversations for a page
 const getConversations = async (req, res, next) => {
     try {
         const { pageId } = req.params;
+        const workspaceId = req.workspace?._id;
 
-        // Verify page belongs to user
-        const page = await Page.findOne({ pageId, userId: req.user.uid });
+        const page = await verifyPageOwnership(pageId, workspaceId);
         if (!page) {
             return res.status(404).json({ success: false, message: "Page not found" });
         }
 
         const conversations = await Conversation.find({ pageId })
             .sort({ lastMessageAt: -1 })
-            .select("senderId profile messages lastMessageAt humanActive lastHumanReplyAt")
+            .select("senderId profile lastMessageAt humanActive lastHumanReplyAt messageCount")
             .lean();
 
-        // Map to include last message preview
+        // Fetch last message per conversation from ConversationMessage (scalable store).
+        // Uses a single aggregation to avoid N+1 queries.
+        const convIds = conversations.map((c) => c._id);
+        const lastMsgs = await ConversationMessage.aggregate([
+            { $match: { conversationId: { $in: convIds } } },
+            { $sort: { createdAt: -1 } },
+            {
+                $group: {
+                    _id: "$conversationId",
+                    content: { $first: "$content" },
+                    role: { $first: "$role" },
+                },
+            },
+        ]);
+
+        const lastMsgMap = {};
+        lastMsgs.forEach((m) => { lastMsgMap[String(m._id)] = m; });
+
         const data = conversations.map((c) => {
-            const lastMsg = c.messages?.[c.messages.length - 1];
+            const last = lastMsgMap[String(c._id)];
             return {
                 _id: c._id,
                 senderId: c.senderId,
                 name: c.profile?.name || null,
                 profilePic: c.profile?.profilePic || null,
-                lastMessage: lastMsg?.content || "",
-                lastMessageRole: lastMsg?.role || "",
+                lastMessage: last?.content || "",
+                lastMessageRole: last?.role || "",
                 lastMessageAt: c.lastMessageAt,
                 humanActive: c.humanActive,
-                messageCount: c.messages?.length || 0,
+                messageCount: c.messageCount || 0,
             };
         });
 
@@ -39,21 +64,38 @@ const getConversations = async (req, res, next) => {
     }
 };
 
-// GET /api/conversations/:pageId/:senderId — get single conversation thread
+// GET /api/conversations/:pageId/:senderId — full conversation thread
 const getConversationThread = async (req, res, next) => {
     try {
         const { pageId, senderId } = req.params;
+        const workspaceId = req.workspace?._id;
+        const page_num = parseInt(req.query.page) || 1;
+        const limit = Math.min(parseInt(req.query.limit) || 50, 100);
+        const skip = (page_num - 1) * limit;
 
-        // Verify page belongs to user
-        const page = await Page.findOne({ pageId, userId: req.user.uid });
+        const page = await verifyPageOwnership(pageId, workspaceId);
         if (!page) {
             return res.status(404).json({ success: false, message: "Page not found" });
         }
 
-        const conversation = await Conversation.findOne({ pageId, senderId }).lean();
+        const conversation = await Conversation.findOne({ pageId, senderId })
+            .select("-messages") // exclude embedded messages — ConversationMessage is canonical
+            .lean();
+
         if (!conversation) {
             return res.status(404).json({ success: false, message: "Conversation not found" });
         }
+
+        // Primary: read from ConversationMessage collection (scalable store)
+        const [messages, total] = await Promise.all([
+            ConversationMessage.find({ conversationId: conversation._id })
+                .sort({ createdAt: 1 })
+                .skip(skip)
+                .limit(limit)
+                .select("role content createdAt attachmentType")
+                .lean(),
+            ConversationMessage.countDocuments({ conversationId: conversation._id }),
+        ]);
 
         res.json({
             success: true,
@@ -63,10 +105,14 @@ const getConversationThread = async (req, res, next) => {
                 profile: conversation.profile,
                 name: conversation.profile?.name || null,
                 profilePic: conversation.profile?.profilePic || null,
-                messages: conversation.messages,
+                messages,
+                totalMessages: total,
+                page: page_num,
+                limit,
                 humanActive: conversation.humanActive,
                 lastHumanReplyAt: conversation.lastHumanReplyAt,
                 lastMessageAt: conversation.lastMessageAt,
+                contextStory: conversation.contextStory,
             },
         });
     } catch (error) {
@@ -79,28 +125,27 @@ const toggleHumanActive = async (req, res, next) => {
     try {
         const { id } = req.params;
         const { humanActive } = req.body;
+        const workspaceId = req.workspace?._id;
 
         if (typeof humanActive !== "boolean") {
             return res.status(400).json({ success: false, message: "humanActive must be a boolean" });
         }
 
         const conversation = await Conversation.findById(id);
-
         if (!conversation) {
             return res.status(404).json({ success: false, message: "Conversation not found" });
         }
 
-        // Verify page belongs to user
-        const page = await Page.findOne({ pageId: conversation.pageId, userId: req.user.uid });
+        // Verify page belongs to workspace
+        const page = await verifyPageOwnership(conversation.pageId, workspaceId);
         if (!page) {
             return res.status(403).json({ success: false, message: "Unauthorized access to this conversation" });
         }
 
         conversation.humanActive = humanActive;
-        // Optionally update lastHumanReplyAt if toggled to true manually, though typically it reflects actual messages
         await conversation.save();
 
-        res.json({ success: true, data: conversation });
+        res.json({ success: true, data: { _id: conversation._id, humanActive: conversation.humanActive } });
     } catch (error) {
         next(error);
     }

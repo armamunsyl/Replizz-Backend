@@ -1,5 +1,6 @@
 import jwt from "jsonwebtoken";
 import User from "../models/User.js";
+import Workspace from "../models/Workspace.js";
 import admin from "../config/firebaseAdmin.js";
 
 // Generate JWT token
@@ -100,8 +101,35 @@ const getMe = async (req, res, next) => {
                 name: req.user.name || email.split('@')[0],
                 email: email,
                 passwordHash: "firebase_oauth_no_password",
-                role: "User"
+                role: "User",
+                firebaseUid: req.user.uid,
             });
+        } else if (!dbUser.firebaseUid && req.user.uid) {
+            // Backfill firebaseUid for existing users on first login
+            dbUser = await User.findOneAndUpdate(
+                { email },
+                { firebaseUid: req.user.uid },
+                { new: true }
+            ).select("-passwordHash");
+        }
+
+        // Load workspace plan info — Workspace is the billing source of truth
+        let workspacePlan = null;
+        if (dbUser.currentWorkspaceId) {
+            const ws = await Workspace.findById(dbUser.currentWorkspaceId)
+                .select("planCode planStatus replyLimit usedReplies billingPeriodEnd isSuspended")
+                .lean();
+            if (ws) {
+                workspacePlan = {
+                    planCode: ws.planCode,
+                    planStatus: ws.planStatus,
+                    replyLimit: ws.replyLimit,
+                    usedReplies: ws.usedReplies,
+                    remainingReplies: Math.max(0, ws.replyLimit - ws.usedReplies),
+                    billingPeriodEnd: ws.billingPeriodEnd,
+                    isSuspended: ws.isSuspended,
+                };
+            }
         }
 
         res.json({
@@ -113,6 +141,8 @@ const getMe = async (req, res, next) => {
                 role: dbUser.role,
                 uid: req.user.uid,
                 createdAt: dbUser.createdAt,
+                currentWorkspaceId: dbUser.currentWorkspaceId,
+                workspacePlan,
             },
         });
     } catch (error) {

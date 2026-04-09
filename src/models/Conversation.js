@@ -1,5 +1,14 @@
 import mongoose from "mongoose";
 
+/**
+ * Conversation — thread state between a Facebook user (PSID) and a Page.
+ *
+ * Stores conversation-level state only.
+ * Full scalable message history lives in ConversationMessage collection.
+ *
+ * The embedded `messages` array is kept for backward compatibility with
+ * existing dashboard inbox reads ($slice: -50). New writes go to BOTH.
+ */
 const messageSchema = new mongoose.Schema({
     role: {
         type: String,
@@ -17,6 +26,13 @@ const messageSchema = new mongoose.Schema({
 });
 
 const conversationSchema = new mongoose.Schema({
+    // Workspace that owns this conversation
+    workspaceId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Workspace",
+        index: true,
+        default: null,
+    },
     pageId: {
         type: String,
         required: true,
@@ -31,6 +47,7 @@ const conversationSchema = new mongoose.Schema({
         name: { type: String, default: null },
         profilePic: { type: String, default: null },
     },
+    // Backward-compat embedded history (capped at 50 by webhook)
     messages: {
         type: [messageSchema],
         default: [],
@@ -39,6 +56,7 @@ const conversationSchema = new mongoose.Schema({
         type: Date,
         default: Date.now,
     },
+    // Rolling context summary — primary AI memory source
     contextStory: {
         type: String,
         default: "",
@@ -78,6 +96,7 @@ const conversationSchema = new mongoose.Schema({
 });
 
 conversationSchema.index({ pageId: 1, senderId: 1 }, { unique: true });
+conversationSchema.index({ workspaceId: 1, lastMessageAt: -1 });
 
 const Conversation = mongoose.model("Conversation", conversationSchema);
 export default Conversation;

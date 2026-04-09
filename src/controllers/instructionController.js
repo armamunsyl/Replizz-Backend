@@ -1,17 +1,26 @@
 import PageInstruction from "../models/PageInstruction.js";
 import Page from "../models/Page.js";
 
+// ─── Helper ───────────────────────────────────────────────────────────────────
+// Verify a page belongs to the caller's workspace before touching instructions.
+const verifyPageOwnership = async (pageId, workspaceId) => {
+    if (!workspaceId) return null;
+    return Page.findOne({ pageId, workspaceId, isActive: true }).lean();
+};
+
 // GET /api/instructions/:pageId — get all instructions for a page
 const getInstructions = async (req, res, next) => {
     try {
         const { pageId } = req.params;
+        const workspaceId = req.workspace?._id;
 
-        const page = await Page.findOne({ pageId, userId: req.user.uid });
+        const page = await verifyPageOwnership(pageId, workspaceId);
         if (!page) {
             return res.status(404).json({ success: false, message: "Page not found" });
         }
 
-        const doc = await PageInstruction.findOne({ pageId, userId: req.user.uid });
+        // One instruction document per page (keyed by pageId)
+        const doc = await PageInstruction.findOne({ pageId });
         res.json({ success: true, data: doc?.instructions || [] });
     } catch (error) {
         next(error);
@@ -23,19 +32,21 @@ const addInstruction = async (req, res, next) => {
     try {
         const { pageId } = req.params;
         const { text } = req.body;
+        const workspaceId = req.workspace?._id;
 
         if (!text || !text.trim()) {
             return res.status(400).json({ success: false, message: "Instruction text is required" });
         }
 
-        const page = await Page.findOne({ pageId, userId: req.user.uid });
+        const page = await verifyPageOwnership(pageId, workspaceId);
         if (!page) {
             return res.status(404).json({ success: false, message: "Page not found" });
         }
 
         const doc = await PageInstruction.findOneAndUpdate(
-            { pageId, userId: req.user.uid },
+            { pageId },
             {
+                $set: { workspaceId },
                 $push: { instructions: { text: text.trim(), isActive: true } },
             },
             { new: true, upsert: true }
@@ -53,13 +64,19 @@ const updateInstruction = async (req, res, next) => {
     try {
         const { pageId, instructionId } = req.params;
         const { text } = req.body;
+        const workspaceId = req.workspace?._id;
 
         if (!text || !text.trim()) {
             return res.status(400).json({ success: false, message: "Instruction text is required" });
         }
 
+        const page = await verifyPageOwnership(pageId, workspaceId);
+        if (!page) {
+            return res.status(404).json({ success: false, message: "Page not found" });
+        }
+
         const doc = await PageInstruction.findOneAndUpdate(
-            { pageId, userId: req.user.uid, "instructions._id": instructionId },
+            { pageId, "instructions._id": instructionId },
             {
                 $set: {
                     "instructions.$.text": text.trim(),
@@ -84,8 +101,14 @@ const updateInstruction = async (req, res, next) => {
 const toggleInstruction = async (req, res, next) => {
     try {
         const { pageId, instructionId } = req.params;
+        const workspaceId = req.workspace?._id;
 
-        const doc = await PageInstruction.findOne({ pageId, userId: req.user.uid });
+        const page = await verifyPageOwnership(pageId, workspaceId);
+        if (!page) {
+            return res.status(404).json({ success: false, message: "Page not found" });
+        }
+
+        const doc = await PageInstruction.findOne({ pageId });
         if (!doc) {
             return res.status(404).json({ success: false, message: "Instructions not found" });
         }
@@ -108,9 +131,15 @@ const toggleInstruction = async (req, res, next) => {
 const deleteInstruction = async (req, res, next) => {
     try {
         const { pageId, instructionId } = req.params;
+        const workspaceId = req.workspace?._id;
+
+        const page = await verifyPageOwnership(pageId, workspaceId);
+        if (!page) {
+            return res.status(404).json({ success: false, message: "Page not found" });
+        }
 
         const doc = await PageInstruction.findOneAndUpdate(
-            { pageId, userId: req.user.uid },
+            { pageId },
             { $pull: { instructions: { _id: instructionId } } },
             { new: true }
         );
